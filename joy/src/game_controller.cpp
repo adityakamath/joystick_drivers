@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020, Open Source Robotics Foundation.
+ * Copyright (c) 2023, CSIRO Data61.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -43,13 +44,13 @@
 #include <sensor_msgs/msg/joy.hpp>
 #include <sensor_msgs/msg/joy_feedback.hpp>
 
-#include "joy/joy.hpp"
+#include "joy/game_controller.hpp"
 
 namespace joy
 {
 
-Joy::Joy(const rclcpp::NodeOptions & options)
-: rclcpp::Node("joy_node", options)
+GameController::GameController(const rclcpp::NodeOptions & options)
+: rclcpp::Node("game_controller_node", options)
 {
   dev_id_ = static_cast<int>(this->declare_parameter("device_id", 0));
 
@@ -99,41 +100,37 @@ Joy::Joy(const rclcpp::NodeOptions & options)
   pub_ = create_publisher<sensor_msgs::msg::Joy>("joy", 10);
 
   feedback_sub_ = this->create_subscription<sensor_msgs::msg::JoyFeedback>(
-    "joy/set_feedback", rclcpp::QoS(10), std::bind(
-      &Joy::feedbackCb, this,
-      std::placeholders::_1));
+    "joy/set_feedback", rclcpp::QoS(10),
+    std::bind(&GameController::feedbackCb, this, std::placeholders::_1));
 
   future_ = exit_signal_.get_future();
 
-  if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) < 0) {
-    throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
-  }
   // In theory we could do this with just a timer, which would simplify the code
   // a bit.  But then we couldn't react to "immediate" events, so we stick with
   // the thread.
-  event_thread_ = std::thread(&Joy::eventThread, this);
+  event_thread_ = std::thread(&GameController::eventThread, this);
+
+  joy_msg_.buttons.resize(SDL_CONTROLLER_BUTTON_MAX);
+
+  joy_msg_.axes.resize(SDL_CONTROLLER_AXIS_MAX);
+
+  if (SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
+    throw std::runtime_error("SDL could not be initialized: " + std::string(SDL_GetError()));
+  }
 }
 
-Joy::~Joy()
+GameController::~GameController()
 {
   exit_signal_.set_value();
   event_thread_.join();
-  if (haptic_ != nullptr) {
-    SDL_HapticClose(haptic_);
-  }
-  if (joystick_ != nullptr) {
-    SDL_JoystickClose(joystick_);
+  if (game_controller_ != nullptr) {
+    SDL_GameControllerClose(game_controller_);
   }
   SDL_Quit();
 }
 
-void Joy::feedbackCb(const std::shared_ptr<sensor_msgs::msg::JoyFeedback> msg)
+void GameController::feedbackCb(const std::shared_ptr<sensor_msgs::msg::JoyFeedback> msg)
 {
-  if (haptic_ == nullptr) {
-    // No ability to do feedback, so ignore.
-    return;
-  }
-
   if (msg->type != sensor_msgs::msg::JoyFeedback::TYPE_RUMBLE) {
     // We only support rumble
     return;
@@ -141,6 +138,7 @@ void Joy::feedbackCb(const std::shared_ptr<sensor_msgs::msg::JoyFeedback> msg)
 
   if (msg->id != 0) {
     // There can be only one (rumble)
+    // TODO(Rod Taylor): Support high and low frequency rumble channels.
     return;
   }
 
@@ -149,11 +147,14 @@ void Joy::feedbackCb(const std::shared_ptr<sensor_msgs::msg::JoyFeedback> msg)
     return;
   }
 
-  // We purposely ignore the return value; if it fails, what can we do?
-  SDL_HapticRumblePlay(haptic_, msg->intensity, 1000);
+  if (game_controller_ != nullptr) {
+    // We purposely ignore the return value; if it fails, what can we do?
+    uint16_t intensity = static_cast<uint16_t>(msg->intensity * 0xFFFF);
+    SDL_GameControllerRumble(game_controller_, intensity, intensity, 1000);
+  }
 }
 
-float Joy::convertRawAxisValueToROS(int16_t val)
+float GameController::convertRawAxisValueToROS(int16_t val)
 {
   // SDL reports axis values between -32768 and 32767.  To make sure
   // we report out scaled value between -1.0 and 1.0, we add one to
@@ -179,22 +180,22 @@ float Joy::convertRawAxisValueToROS(int16_t val)
   return static_cast<float>(double_val * scale_);
 }
 
-bool Joy::handleJoyAxis(const SDL_Event & e)
+bool GameController::handleControllerAxis(const SDL_ControllerAxisEvent & e)
 {
   bool publish = false;
 
-  if (e.jaxis.which != joystick_instance_id_) {
+  if (e.which != joystick_instance_id_) {
     return publish;
   }
 
-  if (e.jaxis.axis >= joy_msg_.axes.size()) {
+  if (e.axis >= SDL_CONTROLLER_AXIS_MAX) {
     RCLCPP_WARN(get_logger(), "Saw axes too large for this device, ignoring");
     return publish;
   }
 
-  float last_axis_value = joy_msg_.axes.at(e.jaxis.axis);
-  joy_msg_.axes.at(e.jaxis.axis) = convertRawAxisValueToROS(e.jaxis.value);
-  if (last_axis_value != joy_msg_.axes.at(e.jaxis.axis)) {
+  float last_axis_value = joy_msg_.axes.at(e.axis);
+  joy_msg_.axes.at(e.axis) = convertRawAxisValueToROS(e.value);
+  if (last_axis_value != joy_msg_.axes.at(e.axis)) {
     if (coalesce_interval_ms_ > 0 && !publish_soon_) {
       publish_soon_ = true;
       publish_soon_time_ = this->now();
@@ -211,135 +212,89 @@ bool Joy::handleJoyAxis(const SDL_Event & e)
   return publish;
 }
 
-bool Joy::handleJoyButtonDown(const SDL_Event & e)
+bool GameController::handleControllerButtonDown(const SDL_ControllerButtonEvent & e)
 {
   bool publish = false;
 
-  if (e.jbutton.which != joystick_instance_id_) {
+  if (e.which != joystick_instance_id_) {
     return publish;
   }
 
-  if (e.jbutton.button >= joy_msg_.buttons.size()) {
+  if (e.button >= SDL_CONTROLLER_BUTTON_MAX) {
     RCLCPP_WARN(get_logger(), "Saw button too large for this device, ignoring");
     return publish;
   }
 
   if (sticky_buttons_) {
     // For sticky buttons, invert 0 -> 1 or 1 -> 0
-    joy_msg_.buttons.at(e.jbutton.button) = 1 - joy_msg_.buttons.at(e.jbutton.button);
+    joy_msg_.buttons.at(e.button) = 1 - joy_msg_.buttons.at(e.button);
   } else {
-    joy_msg_.buttons.at(e.jbutton.button) = 1;
+    joy_msg_.buttons.at(e.button) = 1;
   }
   publish = true;
 
   return publish;
 }
 
-bool Joy::handleJoyButtonUp(const SDL_Event & e)
+bool GameController::handleControllerButtonUp(const SDL_ControllerButtonEvent & e)
 {
   bool publish = false;
 
-  if (e.jbutton.which != joystick_instance_id_) {
+  if (e.which != joystick_instance_id_) {
     return publish;
   }
 
-  if (e.jbutton.button >= joy_msg_.buttons.size()) {
+  if (e.button >= SDL_CONTROLLER_BUTTON_MAX) {
     RCLCPP_WARN(get_logger(), "Saw button too large for this device, ignoring");
     return publish;
   }
 
   if (!sticky_buttons_) {
-    joy_msg_.buttons.at(e.jbutton.button) = 0;
+    joy_msg_.buttons.at(e.button) = 0;
     publish = true;
   }
-
   return publish;
 }
 
-bool Joy::handleJoyHatMotion(const SDL_Event & e)
+void GameController::handleControllerDeviceAdded(const SDL_ControllerDeviceEvent & e)
 {
-  bool publish = false;
-
-  if (e.jhat.which != joystick_instance_id_) {
-    return publish;
+  int num_joysticks = SDL_NumJoysticks();
+  if (num_joysticks < 0) {
+    RCLCPP_WARN(get_logger(), "Failed to get the number of game controllers: %s", SDL_GetError());
+    return;
   }
-
-  // The hats are the last axes in the axes list.  There are two axes per hat;
-  // the first of the pair is for left (positive) and right (negative), while
-  // the second of the pair is for up (positive) and down (negative).
-
-  // Determine which pair we are based on e.jhat.hat
-  int num_axes = SDL_JoystickNumAxes(joystick_);
-  if (num_axes < 0) {
-    RCLCPP_WARN(get_logger(), "Failed to get axes: %s", SDL_GetError());
-    return publish;
-  }
-  size_t axes_start_index = num_axes + e.jhat.hat * 2;
-  // Note that we check axes_start_index + 1 here to ensure that we can write to
-  // either the left/right axis or the up/down axis that corresponds to this hat.
-  if ((axes_start_index + 1) >= joy_msg_.axes.size()) {
-    RCLCPP_WARN(get_logger(), "Saw hat too large for this device, ignoring");
-    return publish;
-  }
-
-  if (e.jhat.value & SDL_HAT_LEFT) {
-    joy_msg_.axes.at(axes_start_index) = 1.0;
-  }
-  if (e.jhat.value & SDL_HAT_RIGHT) {
-    joy_msg_.axes.at(axes_start_index) = -1.0;
-  }
-  if (e.jhat.value & SDL_HAT_UP) {
-    joy_msg_.axes.at(axes_start_index + 1) = 1.0;
-  }
-  if (e.jhat.value & SDL_HAT_DOWN) {
-    joy_msg_.axes.at(axes_start_index + 1) = -1.0;
-  }
-  if (e.jhat.value == SDL_HAT_CENTERED) {
-    joy_msg_.axes.at(axes_start_index) = 0.0;
-    joy_msg_.axes.at(axes_start_index + 1) = 0.0;
-  }
-  publish = true;
-
-  return publish;
-}
-
-void Joy::handleJoyDeviceAdded(const SDL_Event & e)
-{
-  if (!dev_name_.empty()) {
-    int num_joysticks = SDL_NumJoysticks();
-    if (num_joysticks < 0) {
-      RCLCPP_WARN(get_logger(), "Failed to get the number of joysticks: %s", SDL_GetError());
-      return;
+  bool matching_device_found = false;
+  for (int i = 0; i < num_joysticks; ++i) {
+    const char * name = SDL_JoystickNameForIndex(i);
+    if (name == nullptr) {
+      RCLCPP_WARN(get_logger(), "Could not get game controller name: %s", SDL_GetError());
+      continue;
     }
-    bool matching_device_found = false;
-    for (int i = 0; i < num_joysticks; ++i) {
-      const char * name = SDL_JoystickNameForIndex(i);
-      if (name == nullptr) {
-        RCLCPP_WARN(get_logger(), "Could not get joystick name: %s", SDL_GetError());
-        continue;
-      }
-      if (std::string(name) == dev_name_) {
+    RCLCPP_INFO(get_logger(), "Controller Found: device_id=%i, device_name=%s", i, name);
+    if (std::string(name) == dev_name_) {
+      if (!dev_name_.empty()) {
         // We found it!
         matching_device_found = true;
         dev_id_ = i;
         break;
       }
     }
-    if (!matching_device_found) {
-      RCLCPP_WARN(
-        get_logger(), "Could not get joystick with name %s: %s",
-        dev_name_.c_str(), SDL_GetError());
-      return;
-    }
   }
-
-  if (e.jdevice.which != dev_id_) {
+  if (!dev_name_.empty() && !matching_device_found) {
+    RCLCPP_WARN(
+      get_logger(), "Could not get game controller with name %s: %s",
+      dev_name_.c_str(), SDL_GetError());
     return;
   }
 
-  joystick_ = SDL_JoystickOpen(dev_id_);
-  if (joystick_ == nullptr) {
-    RCLCPP_WARN(get_logger(), "Unable to open joystick %d: %s", dev_id_, SDL_GetError());
+  if (e.which != dev_id_) {
+    // ignore device that don't match the dev_id_ specified
+    return;
+  }
+
+  game_controller_ = SDL_GameControllerOpen(dev_id_);
+  if (game_controller_ == nullptr) {
+    RCLCPP_WARN(get_logger(), "Unable to open game controller %d: %s", dev_id_, SDL_GetError());
     return;
   }
 
@@ -347,85 +302,49 @@ void Joy::handleJoyDeviceAdded(const SDL_Event & e)
   // remove event.
   joystick_instance_id_ = SDL_JoystickGetDeviceInstanceID(dev_id_);
   if (joystick_instance_id_ < 0) {
-    RCLCPP_WARN(get_logger(), "Failed to get instance ID for joystick: %s", SDL_GetError());
-    SDL_JoystickClose(joystick_);
-    joystick_ = nullptr;
+    RCLCPP_WARN(get_logger(), "Failed to get instance ID for game controller: %s", SDL_GetError());
+    SDL_GameControllerClose(game_controller_);
+    game_controller_ = nullptr;
     return;
   }
-
-  int num_buttons = SDL_JoystickNumButtons(joystick_);
-  if (num_buttons < 0) {
-    RCLCPP_WARN(get_logger(), "Failed to get number of buttons: %s", SDL_GetError());
-    SDL_JoystickClose(joystick_);
-    joystick_ = nullptr;
-    return;
-  }
-  joy_msg_.buttons.resize(num_buttons);
-
-  int num_axes = SDL_JoystickNumAxes(joystick_);
-  if (num_axes < 0) {
-    RCLCPP_WARN(get_logger(), "Failed to get number of axes: %s", SDL_GetError());
-    SDL_JoystickClose(joystick_);
-    joystick_ = nullptr;
-    return;
-  }
-  int num_hats = SDL_JoystickNumHats(joystick_);
-  if (num_hats < 0) {
-    RCLCPP_WARN(get_logger(), "Failed to get number of hats: %s", SDL_GetError());
-    SDL_JoystickClose(joystick_);
-    joystick_ = nullptr;
-    return;
-  }
-  joy_msg_.axes.resize(num_axes + num_hats * 2);
 
   // Get the initial state for each of the axes
-  for (int i = 0; i < num_axes; ++i) {
-    int16_t state;
-    if (SDL_JoystickGetAxisInitialState(joystick_, i, &state)) {
-      joy_msg_.axes.at(i) = convertRawAxisValueToROS(state);
-    }
+  for (int i = 0; i < SDL_CONTROLLER_AXIS_MAX; ++i) {
+    int16_t state =
+      SDL_GameControllerGetAxis(game_controller_, static_cast<SDL_GameControllerAxis>(i));
+    joy_msg_.axes.at(i) = convertRawAxisValueToROS(state);
   }
 
-  haptic_ = SDL_HapticOpenFromJoystick(joystick_);
-  if (haptic_ != nullptr) {
-    if (SDL_HapticRumbleInit(haptic_) < 0) {
-      // Failed to init haptic.  Clean up haptic_.
-      SDL_HapticClose(haptic_);
-      haptic_ = nullptr;
-    }
-  } else {
-    RCLCPP_INFO(get_logger(), "No haptic (rumble) available, skipping initialization");
+  const char * has_rumble_string = "No";
+  if (SDL_GameControllerHasRumble(game_controller_)) {
+    has_rumble_string = "Yes";
   }
 
   RCLCPP_INFO(
-    get_logger(), "Opened joystick: %s.  deadzone: %f",
-    SDL_JoystickName(joystick_), scaled_deadzone_);
+    get_logger(), "Opened game controller: %s,  deadzone: %f, rumble: %s",
+    SDL_GameControllerName(game_controller_), scaled_deadzone_, has_rumble_string);
 }
 
-void Joy::handleJoyDeviceRemoved(const SDL_Event & e)
+void GameController::handleControllerDeviceRemoved(const SDL_ControllerDeviceEvent & e)
 {
-  if (e.jdevice.which != joystick_instance_id_) {
+  if (e.which != joystick_instance_id_) {
     return;
   }
-
-  joy_msg_.buttons.resize(0);
-  joy_msg_.axes.resize(0);
-  if (haptic_ != nullptr) {
-    SDL_HapticClose(haptic_);
-    haptic_ = nullptr;
-  }
-  if (joystick_ != nullptr) {
-    SDL_JoystickClose(joystick_);
-    joystick_ = nullptr;
+  if (game_controller_ != nullptr) {
+    RCLCPP_INFO(
+      get_logger(), "Game controller Removed: %s.",
+      SDL_GameControllerName(game_controller_));
+    SDL_GameControllerClose(game_controller_);
+    game_controller_ = nullptr;
   }
 }
 
-void Joy::eventThread()
+void GameController::eventThread()
 {
   std::future_status status;
   rclcpp::Time last_publish = this->now();
 
-  do {
+  do{
     bool should_publish = false;
     SDL_Event e;
     int wait_time_ms = autorepeat_interval_ms_;
@@ -435,31 +354,43 @@ void Joy::eventThread()
     int success = SDL_WaitEventTimeout(&e, wait_time_ms);
     if (success == 1) {
       // Succeeded getting an event
-      if (e.type == SDL_JOYAXISMOTION) {
-        should_publish = handleJoyAxis(e);
-      } else if (e.type == SDL_JOYBUTTONDOWN) {
-        should_publish = handleJoyButtonDown(e);
-      } else if (e.type == SDL_JOYBUTTONUP) {
-        should_publish = handleJoyButtonUp(e);
-      } else if (e.type == SDL_JOYHATMOTION) {
-        should_publish = handleJoyHatMotion(e);
-      } else if (e.type == SDL_JOYDEVICEADDED) {
-        handleJoyDeviceAdded(e);
-      } else if (e.type == SDL_JOYDEVICEREMOVED) {
-        handleJoyDeviceRemoved(e);
-      } else {
-        RCLCPP_WARN(get_logger(), "Unknown event type %d", e.type);
+      switch (e.type) {
+        case SDL_CONTROLLERAXISMOTION: {
+            should_publish = handleControllerAxis(e.caxis);
+            break;
+          }
+        case SDL_CONTROLLERBUTTONDOWN: {
+            should_publish = handleControllerButtonDown(e.cbutton);
+            break;
+          }
+        case SDL_CONTROLLERBUTTONUP: {
+            should_publish = handleControllerButtonUp(e.cbutton);
+            break;
+          }
+        case SDL_CONTROLLERDEVICEADDED: {
+            handleControllerDeviceAdded(e.cdevice);
+            break;
+          }
+        case SDL_CONTROLLERDEVICEREMOVED: {
+            handleControllerDeviceRemoved(e.cdevice);
+            break;
+          }
+        case SDL_JOYAXISMOTION:  // Ignore joystick events, they are duplicates of CONTROLLERDEVICE.
+        case SDL_JOYBALLMOTION:
+        case SDL_JOYHATMOTION:
+        case SDL_JOYBUTTONDOWN:
+        case SDL_JOYBUTTONUP:
+        case SDL_JOYDEVICEADDED:
+        case SDL_JOYDEVICEREMOVED: {
+            break;
+          }
+        default: {
+            RCLCPP_INFO(get_logger(), "Unknown event type %d", e.type);
+            break;
+          }
       }
-    }
-
-    if (!should_publish) {
-      // So far, nothing has indicated that we should publish.  However we need to
-      // do additional checking since there are several possible reasons:
-      // 1.  SDL_WaitEventTimeout failed
-      // 2.  SDL_WaitEventTimeout timed out
-      // 3.  SDL_WaitEventTimeout succeeded, but the event that happened didn't cause
-      //     a publish to happen.
-      //
+    } else {
+      // We didn't succeed, either because of a failure or because of a timeout.
       // If we are autorepeating and enough time has passed, set should_publish.
       rclcpp::Time now = this->now();
       rclcpp::Duration diff_since_last_publish = now - last_publish;
@@ -473,7 +404,7 @@ void Joy::eventThread()
       }
     }
 
-    if (joystick_ != nullptr && should_publish) {
+    if (game_controller_ != nullptr && should_publish) {
       joy_msg_.header.frame_id = "joy";
       joy_msg_.header.stamp = this->now();
 
@@ -486,4 +417,4 @@ void Joy::eventThread()
 
 }  // namespace joy
 
-RCLCPP_COMPONENTS_REGISTER_NODE(joy::Joy)
+RCLCPP_COMPONENTS_REGISTER_NODE(joy::GameController)
